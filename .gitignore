@@ -1,0 +1,7 @@
+# build outputs
+*.exe
+*.o
+
+# decoded images / experiment output
+*_out.raw
+workspace/results/
