@@ -1,5 +1,5 @@
 /* ======================================================================== */
-/*  MRVQ + Neighbor Block Copy (block prediction)                           */
+/*  MRVQ + Block Mean + Neighbor Block Copy (block prediction)              */
 /*  Based on MRVQ-mean(p58).c                                               */
 /*                                                                          */
 /*  Block modes:                                                            */
@@ -8,15 +8,18 @@
 /*     2 : Copy reconstructed UP        block                               */
 /*     3 : Copy reconstructed UP-LEFT   block   (only when NB=4)            */
 /*     4 : Copy reconstructed UP-RIGHT  block   (only when NB=4)            */
+/*     5 : Block mean (all 16 pixels = mean, 8 bits)  (only when BM=1)      */
 /*                                                                          */
-/*  Scheme A (NB=2): MRVQ + LEFT + UP                  -> 3 modes, 2 bits   */
-/*  Scheme B (NB=4): MRVQ + LEFT + UP + UL + UR        -> 5 modes, 3 bits   */
+/*  Scheme A (NB=2): MRVQ + LEFT + UP       [+ BM]   -> 3 [4] modes, 2 bits */
+/*  Scheme B (NB=4): MRVQ + LEFT + UP + UL + UR [+ BM] -> 5 [6] modes, 3 b. */
+/*  BM uses a flag code that is otherwise unused, so flag length is equal.  */
 /*                                                                          */
 /*  Mode selection: minimum  J = dist + LAMBDA * bits                       */
 /*                                                                          */
-/*  Usage: MRVQ-copy input_image compressed_image [NB] [LAMBDA]             */
+/*  Usage: MRVQ-copy input_image compressed_image [NB] [LAMBDA] [BM]        */
 /*         NB     : 2 (default) or 4                                        */
 /*         LAMBDA : default 30                                              */
+/*         BM     : 0 (default, off) or 1 (enable block-mean mode)          */
 /*  (source file is ASCII-only to avoid Big5/UTF-8 trouble)                 */
 /* ======================================================================== */
 
@@ -38,7 +41,8 @@
 #define MODE_UP    2
 #define MODE_UL    3
 #define MODE_UR    4
-#define MODENUM    5
+#define MODE_BM    5
+#define MODENUM    6
 
 char               MRCBfile[80]="MRCB_8192.raw";
 
@@ -50,13 +54,14 @@ unsigned char      Cvectors[vectornum][vectorsize];  /* decoder-side reconstruct
 unsigned char      codebook[codenum][vectorsize];
 
 int                IndexTable[vectornum];
-int                blockmean[vectornum];             /* mean used by MRVQ blocks */
+int                blockmean[vectornum];             /* mean used by MRVQ / BM blocks */
 int                EncodingType[vectornum];
 int                cntMode[MODENUM];
 
 /* ---- scheme parameters (set in main) ---- */
 int                NB     = 2;        /* number of copy neighbors: 2 or 4   */
 double             LAMBDA = 30.0;     /* RD multiplier                      */
+int                USEBM  = 0;        /* 1: enable block-mean mode          */
 int                lenFLAG;           /* mode flag bits: 2 (NB=2), 3 (NB=4) */
 int                modeBits[MODENUM]; /* total bits of each mode            */
 
@@ -64,6 +69,7 @@ int                modeBits[MODENUM]; /* total bits of each mode            */
 int                nbOffset[4] = { -1, -blkperrow, -blkperrow-1, -blkperrow+1 };
 
 unsigned long      squar[256];
+double             BitRate;           /* bpp, filled by ImageEncoding       */
 
 FILE               *imagefile,*result,*book;
 
@@ -77,10 +83,10 @@ int main(int argc, char **argv)
 {
  int i,j;
 
- if (argc < 3 || argc > 5)
+ if (argc < 3 || argc > 6)
     {
       printf("\nError : The number of parameters isn't correct ! \n");
-      printf("\nFormat: command input_image compressed_image [NB=2|4] [LAMBDA]\n");
+      printf("\nFormat: command input_image compressed_image [NB=2|4] [LAMBDA] [BM=0|1]\n");
       exit(1);
     }
 
@@ -91,12 +97,20 @@ int main(int argc, char **argv)
       exit(1);
     }
  if (argc>=5) LAMBDA=atof(argv[4]);
+ if (argc>=6) USEBM=atoi(argv[5]);
+ if (USEBM!=0 && USEBM!=1)
+    {
+      printf("\nBM must be 0 or 1.\n");
+      exit(1);
+    }
 
- /* flag bits and per-mode bit cost */
+ /* flag bits and per-mode bit cost
+    (3 or 4 modes fit in 2 bits, 5 or 6 modes fit in 3 bits) */
  lenFLAG=(NB==2)?2:3;
  modeBits[MODE_MRVQ]=lenFLAG+lenMEAN+lenINDEX;
- for(i=MODE_LEFT;i<MODENUM;i++)
+ for(i=MODE_LEFT;i<=MODE_UR;i++)
     modeBits[i]=lenFLAG;
+ modeBits[MODE_BM]=lenFLAG+lenMEAN;
 
  if ((imagefile=fopen(argv[1],"rb"))==NULL)
     {
@@ -119,13 +133,31 @@ int main(int argc, char **argv)
  /* get the codebook */
  for(i=0;i<codenum;i++)
     for(j=0;j<vectorsize;j++)
-       codebook[i][j]=fgetc(book);
+       {
+         int c=fgetc(book);
+         if (c==EOF)
+            {
+              printf("\nCodebook %s is too small (need %d bytes).\n",
+                     MRCBfile,codenum*vectorsize);
+              exit(1);
+            }
+         codebook[i][j]=(unsigned char)c;
+       }
  fclose(book);
 
  /* get the input image */
  for(i=0;i<imagesize;i++)
     for(j=0;j<imagesize;j++)
-       image[i][j]=fgetc(imagefile);
+       {
+         int c=fgetc(imagefile);
+         if (c==EOF)
+            {
+              printf("\nInput image %s is too small (need %d bytes).\n",
+                     argv[1],imagesize*imagesize);
+              exit(1);
+            }
+         image[i][j]=(unsigned char)c;
+       }
  fclose(imagefile);
 
  /* image -> 4x4 vectors */
@@ -182,17 +214,18 @@ int ImageEncoding(void)
  double        cost[MODENUM],bestcost;
  unsigned char Tvector[vectorsize];   /* mean-removed vector   */
  unsigned char recMRVQ[vectorsize];   /* MRVQ reconstruction   */
+ unsigned char recBM[vectorsize];     /* block-mean reconstruction */
  long          totalbits=0;
 
  lastmode=(NB==2)?MODE_UP:MODE_UR;    /* last copy mode in use */
 
  for(i=0;i<vectornum;i++)
     {
-      /* ---------- block mean (needed by MRVQ itself) ---------- */
+      /* ---------- block mean (used by MRVQ and BM modes) ---------- */
       sum=0;
       for(j=0;j<vectorsize;j++)
          sum+=(int)vectors[i][j];
-      mean=sum/vectorsize;
+      mean=(sum+vectorsize/2)/vectorsize;   /* rounded, not truncated */
       blockmean[i]=mean;
 
       /* ---------- mean-removed vector ---------- */
@@ -233,7 +266,7 @@ int ImageEncoding(void)
 
       /* ---------- copy modes ----------
          Use the RECONSTRUCTED blocks (Rvectors); the decoder only has these. */
-      for(m=MODE_LEFT;m<MODENUM;m++)
+      for(m=MODE_LEFT;m<=MODE_UR;m++)
          {
            cost[m]=1.0e30;
            if (m<=lastmode && NeighborAvailable(i,m))
@@ -242,6 +275,14 @@ int ImageEncoding(void)
                         +LAMBDA*modeBits[m];
               }
          }
+
+      /* ---------- block mean mode (flat block, 8 bits) ---------- */
+      for(j=0;j<vectorsize;j++)
+         recBM[j]=(unsigned char)mean;
+      cost[MODE_BM]=1.0e30;
+      if (USEBM)
+         cost[MODE_BM]=(double)BlockDist(vectors[i],recBM)
+                       +LAMBDA*modeBits[MODE_BM];
 
       /* ---------- choose the minimum RD cost ---------- */
       best=MODE_MRVQ;
@@ -260,19 +301,22 @@ int ImageEncoding(void)
       /* store the encoder-side reconstruction for later blocks */
       for(j=0;j<vectorsize;j++)
          {
-           if (best==MODE_MRVQ) Rvectors[i][j]=recMRVQ[j];
-           else                 Rvectors[i][j]=Rvectors[i+nbOffset[best-MODE_LEFT]][j];
+           if      (best==MODE_MRVQ) Rvectors[i][j]=recMRVQ[j];
+           else if (best==MODE_BM)   Rvectors[i][j]=recBM[j];
+           else                      Rvectors[i][j]=Rvectors[i+nbOffset[best-MODE_LEFT]][j];
          }
    }
 
- printf("\nScheme: NB=%d (%d modes, flag=%d bits), LAMBDA=%.1f",
-        NB,(NB==2)?3:5,lenFLAG,LAMBDA);
+ printf("\nScheme: NB=%d BM=%d (%d modes, flag=%d bits), LAMBDA=%.1f",
+        NB,USEBM,((NB==2)?3:5)+USEBM,lenFLAG,LAMBDA);
  printf("\nMRVQ=%5d  LEFT=%5d  UP=%5d",
         cntMode[MODE_MRVQ],cntMode[MODE_LEFT],cntMode[MODE_UP]);
  if (NB==4)
     printf("  UP-LEFT=%5d  UP-RIGHT=%5d",cntMode[MODE_UL],cntMode[MODE_UR]);
- printf("\nTotal bits = %ld, Bit Rate = %8.4f bpp",
-        totalbits,(double)totalbits/(imagesize*imagesize));
+ if (USEBM)
+    printf("  BM=%5d",cntMode[MODE_BM]);
+ BitRate=(double)totalbits/(imagesize*imagesize);
+ printf("\nTotal bits = %ld, Bit Rate = %8.4f bpp",totalbits,BitRate);
  return 0;
 }
 
@@ -300,6 +344,11 @@ int ImageDecoding(void)
                 Cvectors[i][j]=(unsigned char)pixel;
               }
          }
+      else if (mode==MODE_BM)
+         {
+           for(j=0;j<vectorsize;j++)
+              Cvectors[i][j]=(unsigned char)blockmean[i];
+         }
       else
          {
            for(j=0;j<vectorsize;j++)
@@ -320,16 +369,21 @@ int ImageDecoding(void)
 
 int Find_PSNR(void)
 {
- int    i,j;
- long   dist=0L;
- double ave,psnr;
+ int       i,j;
+ long long dist=0LL;                  /* long is only 32 bits on Windows */
+ double    ave,psnr;
 
  for(i=0;i<imagesize;i++)
     for(j=0;j<imagesize;j++)
        dist+=squar[abs((int)image[i][j]-(int)Cimage[i][j])];
 
  ave=(double)dist/(imagesize*imagesize);
- psnr=10*log10(255.0*255.0/ave);
- printf("\ntotal_dist=%10ld avg_dist=%8.3f  PSNR=%8.3f\n",dist,ave,psnr);
+ psnr=(ave>0.0)?10*log10(255.0*255.0/ave):99.99;   /* guard: lossless */
+ printf("\ntotal_dist=%10lld avg_dist=%8.3f  PSNR=%8.3f\n",dist,ave,psnr);
+
+ /* one machine-readable line for batch scripts */
+ printf("RESULT,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%.4f,%.3f\n",
+        NB,USEBM,LAMBDA,cntMode[MODE_MRVQ],cntMode[MODE_LEFT],cntMode[MODE_UP],
+        cntMode[MODE_UL],cntMode[MODE_UR],cntMode[MODE_BM],BitRate,psnr);
  return 0;
 }
